@@ -2,7 +2,7 @@
 % < Author: Gerardo Chowell  ==================================================>
 % <============================================================================>
 
-function [Phatss,npatches,onset_thr,curves,bestfit,data1,P0,AICc_best,factor1,d]=fittingModifiedLogisticFunctionMultiple(RMSES,PS,data1,DT,epidemic_period,M,flagX,numstartpoints,rank1)
+function [Phatss,npatches,onset_thr,curves,bestfit,data1,P0,AICc_best,factor1,d,bootstrapDiagnostics]=fittingModifiedLogisticFunctionMultiple(RMSES,PS,data1,DT,epidemic_period,M,flagX,numstartpoints,rank1)
 
 global flag1 timevect ydata yfit calibrationperiod1
 
@@ -42,13 +42,14 @@ index1=rank1;
 
 %[npatches,onset_thr,P0]
 
-npatches=RMSES(index1,1);
+% RMSES and PS are sparse; the fit functions work with full values.
+npatches=full(RMSES(index1,1));
 
-onset_thr=RMSES(index1,2);
+onset_thr=full(RMSES(index1,2));
 
-AICc_best=RMSES(index1,3);
+AICc_best=full(RMSES(index1,3));
 
-P0=PS(index1,1:npatches*4+2);
+P0=full(PS(index1,1:npatches*4+2));
 
 numparams=get_nparams(method1,dist1,npatches,flag1,1,onset_fixed);
 
@@ -86,71 +87,65 @@ data=data1(:,2);
 
 timevect=(data1(:,1));
 
-rs1=P0(1:npatches);
+% <=============================================================================================>
+% <===== The ranked fit is bootstrapped as it stands (revision 2026-11) ========================>
+% <=============================================================================================>
+% Before, the ranked vector P0 was optimized again here from a single start.
+% When that run moved, the bootstrap was centred on a fit that no longer had
+% the AICc it was ranked with. The screen now returns converged fits
+% (fitSubepidemicModel.m), so P0 is used unchanged and its score is checked.
 
-ps1=P0(npatches+1:2*npatches);
+d=P0(end); % legacy output: the power d of the ranked fit
 
-as1=P0(2*npatches+1:3*npatches);
+fitSettings=subepidemicFitSettings();
+odeOptions=subepidemicOdeOptions();
 
-Ks1=P0(3*npatches+1:4*npatches);
-
-alpha=P0(end-1);
-
-d=P0(end);
-
-z=[rs1 ps1 as1 Ks1 alpha d];
-
-[LB1,UB1]=getbounds(npatches,data);
-
-LB=[LB1 LBe]; %r p a K alpha d
-
-UB=[UB1 UBe];
-
-
+% Same bounds and coordinate scales as the screen used for this candidate.
+[LB,UB,isLog]=subepidemicSearchSpace(npatches,data,flag1,method1,fitSettings);
 
 I0=data(1); % initial condition
 
 hold on
 
-%options=optimset('MaxFunEvals',3000,'MaxIter',3000,'Algorithm','trust-region-reflective','TolFun',1e-6,'TolX',1e-6);
+% Same series as the screen fitted (raw counts for count likelihoods).
+ydata=subepidemicFitSeries(data,smoothfactor1,method1,fitSettings);
 
-%options=[];
+% Explicit fit context: the objective reads nothing from globals.
+context=struct('timevect',timevect,'ydata',ydata,'I0',I0, ...
+    'npatches',npatches,'onset_fixed',onset_fixed,'onset_thr',onset_thr, ...
+    'flag1',flag1,'method1',method1,'odeOptions',odeOptions);
 
-%options = optimoptions('lsqcurvefit','UseParallel',true,...
-%    'TolX',10^(-5),'TolFun',10^(-5));
+[fvalRanked,rankedDetail]=subepidemicObjective(P0,context);
+if ~rankedDetail.success
+    error('SubEpiPredict:RankedFitInvalid', ...
+        'The ranked model %d could not be reproduced: %s',rank1,rankedDetail.message);
+end
+if rankedDetail.nActive~=npatches
+    error('SubEpiPredict:BestModelActivationMismatch', ...
+        'Ranked model %d was fitted with %d sub-epidemics but reconstructs with %d active.', ...
+        rank1,npatches,rankedDetail.nActive);
+end
+AICcCheck=getAICc(method1,dist1,npatches,flag1,1,fvalRanked,length(ydata),onset_fixed);
+if abs(AICcCheck-AICc_best)>1e-8*max(1,abs(AICc_best))
+    subepidemicWarning('SubEpiPredict:RankedScoreChanged', ...
+        ['Ranked model %d: AICc %.10g at the saved vector differs from the ranked AICc %.10g. ', ...
+         'Data, smoothing or ODE settings changed between the screen and the bootstrap.'], ...
+        rank1,AICcCheck,AICc_best);
+end
 
-%[P,resnorm,residual,exitflag,output,lambda,J]=lsqcurvefit(@plotModifiedLogisticGrowthPatch1,z,timevect,smooth(data,smoothfactor1),LB,UB,options,I0,npatches,onset_thr,flag1);
+% A ranked fit with r or K at a search limit is set by the limit, not by the data.
+rankedAtBound=subepidemicBoundSummary(P0,LB,UB,isLog,npatches);
+for k=1:numel(rankedAtBound)
+    if rankedAtBound(k).isSearchLimit
+        subepidemicWarning('SubEpiPredict:RankedModelAtBound', ...
+            ['Ranked model %d has %s at its %s limit (%g). The estimate is set by the limit. ', ...
+             'Set %s in options_fit_settings.m to move it.'], ...
+            rank1,rankedAtBound(k).name,rankedAtBound(k).side,rankedAtBound(k).limit,rankedAtBound(k).setting);
+    end
+end
 
-% resnorm is the SSE which is given by sum(residual.^2)
-% P is the vector with the estimated parameters
-
-
-%method1=3; %LSQ=0, MLE Poisson=1, Pearson chi-squared=2, MLE (Neg Binomial)=3
-
-
-ydata=smoothdata(data,'movmean',smoothfactor1);
-
-options=optimoptions('fmincon','Algorithm','sqp','StepTolerance',1.0000e-6,'MaxFunEvals',20000,'MaxIter',20000);
-
-%options=optimoptions('fmincon','Algorithm','sqp','tolfun',10^-6,'TolX',10^-6,'MaxFunEvals',3200,'MaxIter',3200);
-
-f=@plotModifiedLogisticGrowthPatchMethodLogLik;
-
-problem = createOptimProblem('fmincon','objective',f,'x0',z,'lb',LB,'ub',UB,'options',options);
-
-%ms = MultiStart('PlotFcns',@gsplotbestf);
-ms = MultiStart('Display','final');
-%ms=MultiStart;
-
-%rpoints = RandomStartPointSet('NumStartPoints',numstartpoints); % start with a few random starting sets in addition to the guess supplied by the user (z)
-
-pts = z;
-tpoints = CustomStartPointSet(z);
-%allpts = {tpoints,rpoints};
-allpts = {tpoints};
-
-[P,fval,flagg,outpt,allmins] = run(ms,problem,allpts);
-
+P=P0;
+fval=fvalRanked;
 
 rs_hat=P(1,1:npatches);
 ps_hat=P(1,npatches+1:2*npatches);
@@ -162,7 +157,7 @@ d_hat=P(end);
 
 % Shared initialization, activation reset, and incidence conversion.
 [~,x,totinc,patchIncidence]=simulateSubepidemic(timevect,I0,npatches,onset_fixed, ...
-    onset_thr,flag1,rs_hat,ps_hat,as_hat,Ks_hat);
+    onset_thr,flag1,rs_hat,ps_hat,as_hat,Ks_hat,odeOptions);
 
 
 figure(10)
@@ -192,6 +187,14 @@ elseif method1==6 & dist1==6
     var1=sum((bestfit-data).^2)./(length(bestfit)-numparams); % last revised: 04 Oct 2024
     factor1=sqrt(var1)/sqrt(2);  % scale parameter: b= sigma/sqrt(2);
 
+elseif method1==3 | method1==4 | method1==5
+
+    % Revision 2026-11: the synthetic datasets of this ranked model are drawn
+    % with ITS OWN fitted dispersion. Before, factor1 kept the value the
+    % screen left in the global, i.e. the alpha of the top-ranked model, for
+    % every rank.
+    factor1=alpha_hat;
+
 end
 
 
@@ -215,9 +218,9 @@ set(gcf,'color','white')
 % <======================== Vector with parameter estimates ====================================>
 % <=============================================================================================>
 
-Ptrue=[rs_hat ps_hat as_hat Ks_hat alpha_hat d_hat]
-
-'generate simulation study to derive parameter uncertainty..'
+Ptrue=[rs_hat ps_hat as_hat Ks_hat alpha_hat d_hat];
+fprintf('\nRanked model %d, estimates [r p a K alpha d]: %s\n',rank1,mat2str(full(Ptrue),5));
+fprintf('Bootstrap: %d refits of ranked model %d ...\n',M,rank1);
 
 % <=============================================================================================>
 % <========== Generate parameter uncertainty via parametric bootstrapping ======================>
@@ -233,29 +236,21 @@ curves=zeros(length(yi),M);
 
 
 % <================================================================================================>
-% <=========================== Set initial parameter guesses and bounds ===========================>
+% <=========================== Bootstrap refits ===================================================>
 % <================================================================================================>
+% Each synthetic dataset is refitted by fitSubepidemicModel.m from the ranked
+% vector, one jittered copy of it and fitSettings.bootstrapStarts
+% Latin-hypercube points (default 1): three local runs, as before, but in
+% the scaled search space. The retention policy is unchanged: a refit with
+% no converged local minimum is counted as unresolved and its best valid end
+% point is kept. bootstrapDiagnostics records what happened to each refit.
 
-rs1=P0(1:npatches);
+bootstrapDiagnostics=struct('success',false(M,1),'usedFallback',false(M,1), ...
+    'exitflag',NaN(M,1),'nActive',NaN(M,1),'startAgreement',NaN(M,1), ...
+    'gradientInfNorm',NaN(M,1),'polishRun',false(M,1),'polishImproved',false(M,1), ...
+    'nAtBound',NaN(M,1),'fval',NaN(M,1));
 
-ps1=P0(npatches+1:2*npatches);
-
-as1=P0(2*npatches+1:3*npatches);
-
-Ks1=P0(3*npatches+1:4*npatches);
-
-alpha=P0(end-1);
-
-d=P0(end);
-
-z=[rs1 ps1 as1 Ks1 alpha d];
-
-[LB1,UB1]=getbounds(npatches,data);
-
-LB=[LB1 LBe]; %r p a K alpha d
-
-UB=[UB1 UBe];
- 
+bootContext=context;
 
 % Bootstrap counts for user-facing diagnostics only.
 acceptedBootstrap = 0;
@@ -266,45 +261,44 @@ for real=1:M
     
     curves(:,real)=yirData;
     
-    
     I0=data(1); % initial condition
     
     ydata=yirData;
 
-    %ydata=smooth(yirData,smoothfactor1);
+    bootContext.ydata=yirData;
+
+    [Pboot,fvalBoot,bootInfo]=fitSubepidemicModel(bootContext,P,LB,UB,isLog,[], ...
+        fitSettings.bootstrapStarts,fitSettings);
+
+    if bootInfo.success
+        nActiveBoot=bootInfo.nActive;
+    elseif ~isempty(bootInfo.fallback)
+        % unresolved refit: keep its best valid end point (legacy policy)
+        Pboot=bootInfo.fallback.P;
+        fvalBoot=bootInfo.fallback.fval;
+        nActiveBoot=bootInfo.fallback.nActive;
+        bootstrapDiagnostics.usedFallback(real)=true;
+    else
+        error('SubEpiPredict:BootstrapFitFailed', ...
+            'Bootstrap dataset %d of ranked model %d has no valid parameter vector: %s', ...
+            real,rank1,bootInfo.message);
+    end
+
+    acceptedBootstrap = acceptedBootstrap + double(bootInfo.success);
+
+    bootstrapDiagnostics.success(real)=bootInfo.success;
+    bootstrapDiagnostics.exitflag(real)=bootInfo.exitflag;
+    bootstrapDiagnostics.nActive(real)=nActiveBoot;
+    bootstrapDiagnostics.startAgreement(real)=bootInfo.startAgreement;
+    bootstrapDiagnostics.gradientInfNorm(real)=bootInfo.gradientInfNorm;
+    bootstrapDiagnostics.polishRun(real)=bootInfo.polish.run;
+    bootstrapDiagnostics.polishImproved(real)=bootInfo.polish.improved;
+    bootstrapDiagnostics.nAtBound(real)=numel(bootInfo.atLowerBound)+numel(bootInfo.atUpperBound);
+    bootstrapDiagnostics.fval(real)=fvalBoot;
     
-    %options=optimset('MaxFunEvals',3000,'MaxIter',3000,'Algorithm','trust-region-reflective','TolFun',1e-5,'TolX',1e-5);
-    
-    %options=[];
-    
-    %options = optimoptions('lsqcurvefit','UseParallel',true,...
-    %    'TolX',10^(-5),'TolFun',10^(-5));
-    
-    options=optimoptions('fmincon','Algorithm','sqp','StepTolerance',1.0000e-6,'MaxFunEvals',20000,'MaxIter',20000);
-    
-    f=@plotModifiedLogisticGrowthPatchMethodsFullLogLik;
-    
-    problem = createOptimProblem('fmincon','objective',f,'x0',z,'lb',LB,'ub',UB,'options',options);
-    
-    %ms = MultiStart('PlotFcns',@gsplotbestf);
-    %ms = MultiStart('Display','final');
-    ms = MultiStart('Display','off');
-    
-    %ms=MultiStart;
-    
-    %one random start guess
-    rpoints = RandomStartPointSet('NumStartPoints',2); % start with a few random starting sets
-    
-    pts = z;
-    tpoints = CustomStartPointSet(z);
-    allpts = {tpoints,rpoints};
-    %allpts = {tpoints};
-    
-    [P,fval,flagg,outpt,allmins] = run(ms,problem,allpts);
-    
-    acceptedBootstrap = acceptedBootstrap + (flagg > 0 && isfinite(fval));
-    
-    Phatss(real,:)=P;
+    % Revision m: the same fixed order of interchangeable sub-epidemics as
+    % in the screen, so a refit cannot swap their labels.
+    Phatss(real,:)=subepidemicOrderLabels(Pboot,npatches,onset_fixed,onset_thr,data(1));
     
 end
 
@@ -312,5 +306,69 @@ end
 fprintf('\nBootstrap summary for ranked model %d:\n', rank1);
 fprintf('Requested bootstrap datasets: %d\n', M);
 fprintf('Accepted bootstrap datasets: %d\n', acceptedBootstrap);
-fprintf('Unresolved bootstrap datasets: %d\n\n', M - acceptedBootstrap);
+fprintf('Unresolved bootstrap datasets: %d\n', M - acceptedBootstrap);
+fprintf('Refits with fewer than %d active sub-epidemics: %d\n', npatches, sum(bootstrapDiagnostics.nActive<npatches));
+% Revision m: one rule for "at a bound", that of the PII table
+% (subepidemicBoundHitFractions.m: within 0.1% of the bound).
+[boundReport,boundLines,nRefitsAtBound]=subepidemicBoundSummary(Phatss,LB,UB,isLog,npatches);
+fprintf('Refits with a parameter at a bound: %d\n', nRefitsAtBound);
+for k=1:numel(boundLines)
+    fprintf('   %s refits\n',boundLines{k});
+end
+fprintf('Refits in which the polish ran: %d\n\n', sum(bootstrapDiagnostics.polishRun));
+
+bootstrapDiagnostics.rankedAtBound=rankedAtBound;
+bootstrapDiagnostics.boundReport=boundReport;
+
+% <================================================================================================>
+% <=========================== Parameter identifiability (PII) ====================================>
+% <================================================================================================>
+% The measures of the QuantDiffForecast toolbox for every parameter of this
+% ranked model (subepidemicIdentifiability.m): PII = log10(UB/LB) of the 95%
+% bootstrap interval, the share of the search range the interval covers, the
+% largest PII the bounds allow and the ratio to it, the share of the refits
+% at each bound, and the Monte Carlo error of the interval and of the PII.
+% The search bounds are saved with them, so plotFit_subepidemicFramework.m
+% reports against the bounds this fit used.
+bootstrapDiagnostics.searchLB=LB;
+bootstrapDiagnostics.searchUB=UB;
+bootstrapDiagnostics.searchIsLog=isLog;
+bootstrapDiagnostics.identifiability=subepidemicIdentifiability(Phatss,LB,UB,npatches,P0,fitSettings.PIIscale);
+subepidemicPrintPII(bootstrapDiagnostics.identifiability, ...
+    sprintf('Parameter identifiability (PII) of ranked model %d',rank1));
+
+% Revision m. A parameter whose 95% interval covers at least
+% notIdentifiedRatio (default 0.5) of what the search bounds allow is not
+% identified by the data: its interval is the search range, wherever the
+% bounds are put. It gets its own warning, and the advice to move a bound
+% (below) is kept for parameters that are identified apart from the bound.
+piiReport=bootstrapDiagnostics.identifiability;
+notIdentified=find(~piiReport.fixed(:) & piiReport.PII_ratio(:)>=fitSettings.notIdentifiedRatio)';
+for k=notIdentified
+    if piiReport.PII_scale(k)==1
+        coverText=sprintf('%.0f%% of the search range on the log scale (%.1f of %.1f decades)', ...
+            100*piiReport.PII_ratio(k),piiReport.PII(k),piiReport.PII_box(k));
+    else
+        coverText=sprintf('%.0f%% of the search range',100*piiReport.PII_ratio(k));
+    end
+    subepidemicWarning('SubEpiPredict:NotIdentified', ...
+        ['Ranked model %d: %s is not identified by these data. Its 95%% interval, %.4g to %.4g, covers %s, ', ...
+         'so it reflects the search bounds, not the data; moving a bound moves the interval. ', ...
+         'Do not interpret its estimate (%.4g).'], ...
+        rank1,piiReport.name{k},piiReport.CI_LB(k),piiReport.CI_UB(k),coverText,piiReport.estimate(k));
+end
+bootstrapDiagnostics.notIdentified=piiReport.name(notIdentified);
+notIdentifiedColumns=piiReport.column(notIdentified);
+
+% More than 2.5% of the refits at a limit of r or K: the 95% percentile
+% interval of that parameter ends at the limit instead of where the data put it.
+for k=1:numel(boundReport)
+    if boundReport(k).isSearchLimit && boundReport(k).fraction>0.025 && ~any(notIdentifiedColumns==boundReport(k).index)
+        subepidemicWarning('SubEpiPredict:BootstrapAtBound', ...
+            ['Ranked model %d: %d of %d bootstrap refits have %s at its %s limit (%g), so its 95%% interval ', ...
+             'ends at the limit. Set %s in options_fit_settings.m to move it.'], ...
+            rank1,boundReport(k).count,boundReport(k).total,boundReport(k).name,boundReport(k).side, ...
+            boundReport(k).limit,boundReport(k).setting);
+    end
+end
 
